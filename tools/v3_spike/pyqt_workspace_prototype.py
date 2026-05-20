@@ -53,7 +53,9 @@ except ImportError:  # pragma: no cover
     load_dotenv = None
 
 import capture_kakao_window as capture
+from chat_context_reader import read_chat_context
 from kakao_remote_client import RemoteKakaoClient
+from v3_workspace_store import load_workspace_settings, save_workspace_settings
 from pyqt_live_preview import (
     ClickablePreviewLabel,
     crop_native_input_area,
@@ -608,19 +610,29 @@ class RoomRowWidget(QFrame):
 class WorkspaceWindow(QMainWindow):
     def __init__(self, allow_send: bool, interval_ms: int, hide_native_input_px: int) -> None:
         super().__init__()
+        self._loaded_settings = load_workspace_settings()
+        _ui = self._loaded_settings.get("ui") or {}
         self.allow_send = allow_send
-        self.interval_ms = interval_ms
-        self.hide_native_input_px = hide_native_input_px
+        self.interval_ms = int(_ui.get("interval_ms") or interval_ms)
+        self.hide_native_input_px = int(
+            _ui.get("hide_native_input_px")
+            if _ui.get("hide_native_input_px") is not None
+            else hide_native_input_px
+        )
         self.selected_hwnd: int | None = None
         self.selected_title = ""
         self.main_hwnd: int | None = None
         self.kakao_any_hwnd: int | None = None
         self.last_image = None
         self.last_main_image = None
-        self.reservations: list[dict] = []
+        self.reservations: list[dict] = list(
+            self._loaded_settings.get("reservations") or []
+        )
         self.chat_rooms: list[tuple[int, str]] = []
         self.unregistered_rooms: list[tuple[int, str]] = []
-        self.known_rooms: dict[str, int | None] = {}
+        self.known_rooms: dict[str, int | None] = {
+            str(t): True for t in (self._loaded_settings.get("known_room_titles") or [])
+        }
         self.pc_name = socket.gethostname()
         self._refresh_error_count = 0
         self._viewing_dialog = False
@@ -651,6 +663,11 @@ class WorkspaceWindow(QMainWindow):
 
         self._setup_ui()
         self._wire_timers()
+        self._save_settings_timer = QTimer(self)
+        self._save_settings_timer.setSingleShot(True)
+        self._save_settings_timer.setInterval(800)
+        self._save_settings_timer.timeout.connect(self._save_workspace_settings_now)
+        self._apply_loaded_settings()
         self._local_status = "온라인"
         self._local_badge = 0
         self.refresh_candidates()
@@ -1119,10 +1136,27 @@ class WorkspaceWindow(QMainWindow):
         level_row.addStretch()
         ai_layout.addLayout(level_row)
 
+        ai_actions = QHBoxLayout()
+        read_chat_btn = GhostButton("채팅 읽기")
+        read_chat_btn.clicked.connect(self.read_chat_into_ai_context)
+        ai_actions.addWidget(read_chat_btn)
         ai_btn = PrimaryButton("AI 답변 후보 생성")
-        ai_btn.clicked.connect(self.show_mock_ai_reply)
-        ai_layout.addWidget(ai_btn)
+        ai_btn.clicked.connect(self.show_ai_reply_dialog)
+        ai_actions.addWidget(ai_btn)
+        ai_actions.addStretch()
+        ai_layout.addLayout(ai_actions)
         layout.addWidget(ai_group)
+        for edit in (
+            self.ai_role_edit,
+            self.ai_prompt_edit,
+            self.ai_examples_edit,
+            self.ai_sources_edit,
+            self.ai_chat_context_edit,
+            self.ai_guardrails_edit,
+        ):
+            edit.textChanged.connect(self._queue_save_workspace_settings)
+        self.ai_mode_combo.currentIndexChanged.connect(self._queue_save_workspace_settings)
+        self.ai_level_spin.valueChanged.connect(self._queue_save_workspace_settings)
         layout.addStretch()
 
         scroll.setWidget(tab)
@@ -1166,7 +1200,14 @@ class WorkspaceWindow(QMainWindow):
         self.crop_spin = QSpinBox()
         self.crop_spin.setRange(0, 500)
         self.crop_spin.setValue(self.hide_native_input_px)
+        self.crop_spin.valueChanged.connect(self._queue_save_workspace_settings)
         controls.addWidget(self.crop_spin)
+        self.auto_refresh_checkbox.toggled.connect(self._queue_save_workspace_settings)
+        self.forward_click_checkbox.toggled.connect(self._queue_save_workspace_settings)
+        self.forward_double_click_checkbox.toggled.connect(
+            self._queue_save_workspace_settings
+        )
+        self.background_input_checkbox.toggled.connect(self._queue_save_workspace_settings)
         refresh = GhostButton("지금 갱신")
         refresh.clicked.connect(self.refresh_preview)
         controls.addWidget(refresh)
@@ -1281,7 +1322,7 @@ class WorkspaceWindow(QMainWindow):
         self.reserve_minutes_spin.setFixedWidth(64)
         reserve_row.addWidget(self.reserve_minutes_spin)
         reserve_btn = GhostButton("예약 발송")
-        reserve_btn.clicked.connect(self.add_mock_reservation)
+        reserve_btn.clicked.connect(self.add_reservation)
         reserve_row.addWidget(reserve_btn)
         layout.addLayout(reserve_row)
 
@@ -1734,6 +1775,7 @@ class WorkspaceWindow(QMainWindow):
         open_titles = {title for _, title in chats}
         for _, title in chats:
             self.known_rooms[title] = True
+        self._queue_save_workspace_settings()
         self.unregistered_rooms = [
             (0, title) for title in self.known_rooms if title not in open_titles
         ]
@@ -1962,6 +2004,79 @@ class WorkspaceWindow(QMainWindow):
         self._rebuild_left_rooms()
         self.refresh_preview()
 
+    # -------------------------------------------------------------------
+    # Settings persistence (A)
+    # -------------------------------------------------------------------
+
+    def _apply_loaded_settings(self) -> None:
+        ui = self._loaded_settings.get("ui") or {}
+        ai = self._loaded_settings.get("ai") or {}
+        self.auto_refresh_checkbox.setChecked(ui.get("auto_refresh", True))
+        self.forward_click_checkbox.setChecked(ui.get("forward_click", True))
+        self.forward_double_click_checkbox.setChecked(
+            ui.get("forward_double_click", False)
+        )
+        self.background_input_checkbox.setChecked(ui.get("background_input", True))
+        self.crop_spin.setValue(int(ui.get("hide_native_input_px", self.hide_native_input_px)))
+        self.timer.setInterval(self.interval_ms)
+        self.ai_mode_combo.setCurrentIndex(int(ai.get("mode_index", 1)))
+        self.ai_level_spin.setValue(int(ai.get("level", 3)))
+        self.ai_role_edit.setPlainText(ai.get("role", ""))
+        self.ai_prompt_edit.setPlainText(ai.get("prompt", ""))
+        self.ai_examples_edit.setPlainText(ai.get("examples", ""))
+        self.ai_sources_edit.setPlainText(ai.get("sources", ""))
+        self.ai_chat_context_edit.setPlainText(ai.get("chat_context", ""))
+        self.ai_guardrails_edit.setPlainText(ai.get("guardrails", ""))
+        if self.reservations:
+            self.refresh_reservation_views()
+
+    def _queue_save_workspace_settings(self, *_args) -> None:
+        self._save_settings_timer.start()
+
+    def _save_workspace_settings_now(self) -> None:
+        ui = {
+            "auto_refresh": self.auto_refresh_checkbox.isChecked(),
+            "forward_click": self.forward_click_checkbox.isChecked(),
+            "forward_double_click": self.forward_double_click_checkbox.isChecked(),
+            "background_input": self.background_input_checkbox.isChecked(),
+            "hide_native_input_px": self.crop_spin.value(),
+            "interval_ms": self.timer.interval(),
+        }
+        ai = {
+            "mode_index": self.ai_mode_combo.currentIndex(),
+            "level": self.ai_level_spin.value(),
+            "role": self.ai_role_edit.toPlainText(),
+            "prompt": self.ai_prompt_edit.toPlainText(),
+            "examples": self.ai_examples_edit.toPlainText(),
+            "sources": self.ai_sources_edit.toPlainText(),
+            "chat_context": self.ai_chat_context_edit.toPlainText(),
+            "guardrails": self.ai_guardrails_edit.toPlainText(),
+        }
+        save_workspace_settings(
+            ui=ui,
+            ai=ai,
+            known_room_titles=sorted(self.known_rooms.keys()),
+            reservations=self.reservations,
+        )
+
+    def _verify_main_list_click(self, rooms_before: int) -> None:
+        after = len(self.chat_rooms)
+        if after > rooms_before:
+            self.set_status(f"목록 클릭 확인 · 열린 톡방 {after}개 (+{after - rooms_before})")
+        else:
+            self.set_status(
+                "목록 클릭 — 새 톡방이 안 열린 것 같습니다. 위치를 다시 클릭하세요.",
+                is_error=True,
+            )
+
+    def _verify_preview_click(self, label: str) -> None:
+        if self.selected_hwnd is None:
+            self.set_status(f"{label} — 선택된 창 없음", is_error=True)
+
+    # -------------------------------------------------------------------
+    # Status
+    # -------------------------------------------------------------------
+
     def set_status(self, message: str, *, is_error: bool | None = None) -> None:
         self.summary_label.setText(message)
         short = message if len(message) <= 72 else message[:70] + "…"
@@ -2124,6 +2239,7 @@ class WorkspaceWindow(QMainWindow):
             log.debug("Preview click: %s", detail)
             self.set_status(f"클릭 전달 · {detail}")
             QTimer.singleShot(300, self.refresh_preview)
+            QTimer.singleShot(500, lambda: self._verify_preview_click("클릭"))
         except Exception as exc:
             log.error("Preview click failed: %s\n%s", exc, traceback.format_exc())
             QMessageBox.warning(self, "클릭 전달 실패", str(exc))
@@ -2197,12 +2313,14 @@ class WorkspaceWindow(QMainWindow):
     def handle_main_preview_click(self, image_x: int, image_y: int) -> None:
         if self.main_hwnd is None:
             return
+        rooms_before = len(self.chat_rooms)
         try:
             size = self.last_main_image.size if self.last_main_image else (1, 1)
             detail = post_background_click(self.main_hwnd, image_x, image_y, size)
             log.debug("Main list click: %s", detail)
             self.set_status(f"목록 클릭 · {detail}")
             QTimer.singleShot(700, self.refresh_candidates)
+            QTimer.singleShot(900, lambda: self._verify_main_list_click(rooms_before))
         except Exception as exc:
             log.error("Main list click failed: %s\n%s", exc, traceback.format_exc())
             QMessageBox.warning(self, "목록 클릭 실패", str(exc))
@@ -2400,7 +2518,7 @@ class WorkspaceWindow(QMainWindow):
     # Reservations
     # -------------------------------------------------------------------
 
-    def add_mock_reservation(self) -> None:
+    def add_reservation(self) -> None:
         if not self.selected_title:
             QMessageBox.information(self, "선택 필요", "예약할 톡방을 선택하세요.")
             return
@@ -2409,20 +2527,82 @@ class WorkspaceWindow(QMainWindow):
             QMessageBox.warning(self, "입력 필요", "예약 메시지를 입력하세요.")
             return
         minutes = self.reserve_minutes_spin.value()
+        if self.allow_send:
+            reply = QMessageBox.question(
+                self,
+                "예약 실제 전송",
+                f"{minutes}분 후 「{self.selected_title}」에 실제 전송합니다.\n계속할까요?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
         self.reservations.append(
             {
                 "room": self.selected_title,
                 "message": text,
                 "send_at": datetime.now() + timedelta(minutes=minutes),
                 "created_at": datetime.now(),
+                "hwnd": self.selected_hwnd,
             }
         )
         log.info("Reservation: %r in %d min", self.selected_title, minutes)
-        self.set_status(f"{self.selected_title} · {minutes}분 후 예약")
+        mode = "실제" if self.allow_send else "모의"
+        self.set_status(f"{self.selected_title} · {minutes}분 후 예약 ({mode})")
+        self.refresh_reservation_views()
+        self._rebuild_room_lists()
+        self._save_workspace_settings_now()
+
+    def _process_due_reservations(self) -> None:
+        now = datetime.now()
+        due = [r for r in self.reservations if r["send_at"] <= now]
+        if not due:
+            return
+        for item in due:
+            self._execute_reservation(item)
+        self.reservations = [r for r in self.reservations if r["send_at"] > now]
+        self._save_workspace_settings_now()
         self.refresh_reservation_views()
         self._rebuild_room_lists()
 
+    def _execute_reservation(self, item: dict) -> None:
+        title = item.get("room", "")
+        text = item.get("message", "")
+        hwnd = item.get("hwnd")
+        target_hwnd: int | None = None
+        if hwnd and capture.is_window_valid(int(hwnd)):
+            target_hwnd = int(hwnd)
+        else:
+            for h, t in self.chat_rooms:
+                if t == title:
+                    target_hwnd = h
+                    break
+        if target_hwnd is None:
+            self.set_status(f"예약 스킵 · '{title}' 창이 열려 있지 않음", is_error=True)
+            log.warning("Reservation skipped, room not open: %r", title)
+            return
+        if not self._is_local_pc_active():
+            self.set_status(f"예약 스킵 · 원격 PC는 자동 전송 미지원 ({title})", is_error=True)
+            return
+        self.set_selected_room(target_hwnd, title)
+        if not self.allow_send:
+            log.info("Reservation mock send to %r", title)
+            self.set_status(f"예약 모의 전송 · {title}")
+            return
+        try:
+            if self.background_input_checkbox.isChecked():
+                send_text_to_chat_background(target_hwnd, text)
+            else:
+                send_text_to_chat(target_hwnd, text)
+            log.info("Reservation sent to %r", title)
+            self.set_status(f"예약 전송 완료 · {title}")
+            QTimer.singleShot(800, self.refresh_preview)
+        except Exception as exc:
+            log.error("Reservation send failed: %s", exc)
+            self.set_status(f"예약 전송 실패 · {title}: {exc}", is_error=True)
+
     def refresh_reservation_views(self) -> None:
+        self._process_due_reservations()
         self._clear_layout(self.reservation_container)
         sorted_items = sorted(self.reservations, key=lambda item: item["send_at"])
         if not sorted_items:
@@ -2447,7 +2627,33 @@ class WorkspaceWindow(QMainWindow):
     # AI
     # -------------------------------------------------------------------
 
-    def show_mock_ai_reply(self) -> None:
+    def read_chat_into_ai_context(self) -> None:
+        if not self._is_local_pc_active():
+            QMessageBox.information(
+                self, "로컬 전용", "채팅 읽기는 이 PC의 열린 톡방에서만 지원합니다."
+            )
+            return
+        if self.selected_hwnd is None:
+            QMessageBox.information(self, "선택 필요", "톡방을 먼저 선택하세요.")
+            return
+        text, hint = read_chat_context(self.selected_hwnd)
+        if text:
+            self.ai_chat_context_edit.setPlainText(text)
+            self._queue_save_workspace_settings()
+            self.set_status(f"채팅 읽기 완료 · {hint}")
+        else:
+            self.set_status(hint, is_error=True)
+
+    @staticmethod
+    def _clean_ai_reply_for_send(reply: str) -> str:
+        lines = reply.strip().splitlines()
+        if lines and lines[0].startswith("[REVIEW]"):
+            return "\n".join(lines[1:]).strip() or reply
+        if lines and lines[0].startswith("[AUTO]"):
+            return "\n".join(lines[1:]).strip() or reply
+        return reply.strip()
+
+    def show_ai_reply_dialog(self) -> None:
         if not self.selected_title:
             QMessageBox.information(self, "선택 필요", "톡방을 먼저 선택하세요.")
             return
@@ -2455,6 +2661,8 @@ class WorkspaceWindow(QMainWindow):
         if mode == "off":
             QMessageBox.information(self, "AI 꺼짐", "semi 또는 on으로 변경하세요.")
             return
+        if not self.ai_chat_context_edit.toPlainText().strip():
+            self.read_chat_into_ai_context()
         try:
             reply = self.generate_ai_reply(
                 mode=mode,
@@ -2470,7 +2678,61 @@ class WorkspaceWindow(QMainWindow):
             log.error("AI reply failed: %s\n%s", exc, traceback.format_exc())
             QMessageBox.warning(self, "AI 호출 실패", str(exc))
             return
-        QMessageBox.information(self, "AI 답변 후보", reply)
+        self._open_ai_reply_dialog(reply)
+
+    def _open_ai_reply_dialog(self, reply: str) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("AI 답변 후보")
+        dlg.resize(640, 420)
+        dlg.setStyleSheet(
+            f"background: {COLORS['bg']}; color: {COLORS['text']};"
+        )
+        layout = QVBoxLayout(dlg)
+        body = QTextEdit()
+        body.setReadOnly(True)
+        body.setPlainText(reply)
+        body.setStyleSheet(
+            f"background: {COLORS['card']}; border: 1px solid {COLORS['border']};"
+        )
+        layout.addWidget(body)
+        btn_row = QHBoxLayout()
+        apply_bottom = PrimaryButton("하단 입력창에 적용")
+        apply_screen = GhostButton("작업 탭 입력에 적용")
+        apply_both = GhostButton("둘 다 적용")
+        close_btn = GhostButton("닫기")
+
+        clean = self._clean_ai_reply_for_send(reply)
+
+        def _apply_bottom() -> None:
+            self.message_edit.setPlainText(clean)
+            self.set_status(f"AI 후보 → 하단 입력 · {self.selected_title}")
+
+        def _apply_screen() -> None:
+            self._suppress_text_changed = True
+            self.screen_input.setText(clean)
+            self._suppress_text_changed = False
+            if self._is_local_pc_active() and self.selected_hwnd:
+                try:
+                    type_text_to_chat_background(self.selected_hwnd, clean)
+                except Exception as exc:
+                    log.debug("AI apply to kakao failed: %s", exc)
+            self.set_status(f"AI 후보 → 작업 입력 · {self.selected_title}")
+
+        def _apply_both() -> None:
+            _apply_bottom()
+            _apply_screen()
+
+        apply_bottom.clicked.connect(_apply_bottom)
+        apply_screen.clicked.connect(_apply_screen)
+        apply_both.clicked.connect(_apply_both)
+        close_btn.clicked.connect(dlg.close)
+        btn_row.addWidget(apply_bottom)
+        btn_row.addWidget(apply_screen)
+        btn_row.addWidget(apply_both)
+        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+        dlg.exec()
 
     def current_capture_as_data_url(self) -> str | None:
         image = self.last_image
@@ -2675,6 +2937,7 @@ class WorkspaceWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         log.info("Window closing")
+        self._save_workspace_settings_now()
         self.timer.stop()
         self.countdown_timer.stop()
         if self._embedded_hub:
