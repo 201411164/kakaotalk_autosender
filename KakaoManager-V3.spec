@@ -18,6 +18,7 @@ hiddenimports = [
     'auto_update_runner',
     'v3_workspace_store',
     'chat_context_reader',
+    'kakao_multi_instance',
 ]
 
 excludes = [
