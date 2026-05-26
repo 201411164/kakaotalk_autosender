@@ -43,6 +43,8 @@ def default_settings() -> dict[str, Any]:
         },
         "known_room_titles": [],
         "reservations": [],
+        "instance_names": {},
+        "kakao_exe_path": "",
     }
 
 
@@ -94,6 +96,10 @@ def load_workspace_settings() -> dict[str, Any]:
                 }
             )
         base["reservations"] = reservations
+        raw_names = raw.get("instance_names") or {}
+        if isinstance(raw_names, dict):
+            base["instance_names"] = {str(k): str(v) for k, v in raw_names.items()}
+        base["kakao_exe_path"] = str(raw.get("kakao_exe_path") or "")
         return base
     except Exception:
         log.error("Failed to load workspace settings", exc_info=True)
@@ -106,6 +112,8 @@ def save_workspace_settings(
     ai: dict[str, Any],
     known_room_titles: list[str],
     reservations: list[dict],
+    instance_names: dict[str, str] | None = None,
+    kakao_exe_path: str = "",
 ) -> None:
     payload = {
         "version": 1,
@@ -114,6 +122,8 @@ def save_workspace_settings(
         "ai": ai,
         "known_room_titles": known_room_titles,
         "reservations": [_serialize_reservation(r) for r in reservations],
+        "instance_names": instance_names or {},
+        "kakao_exe_path": kakao_exe_path or "",
     }
     try:
         SETTINGS_PATH.write_text(

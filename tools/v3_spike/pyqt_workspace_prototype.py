@@ -34,6 +34,8 @@ from PyQt6.QtWidgets import (
     QFrame,
     QGroupBox,
     QHBoxLayout,
+    QFileDialog,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -55,9 +57,11 @@ except ImportError:  # pragma: no cover
 import capture_kakao_window as capture
 from chat_context_reader import read_chat_context
 from kakao_multi_instance import (
+    find_kakao_exe,
     get_kakao_instance_count,
     get_pid_for_hwnd,
-    unlock_multi_instance,
+    launch_new_instance,
+    terminate_kakao_instance,
 )
 from kakao_remote_client import RemoteKakaoClient
 from v3_workspace_store import load_workspace_settings, save_workspace_settings
@@ -460,6 +464,66 @@ class PcRowWidget(QFrame):
 
 
 # ---------------------------------------------------------------------------
+# KakaoTalk session card (multi-instance)
+# ---------------------------------------------------------------------------
+
+class SessionCardWidget(QFrame):
+    clicked = pyqtSignal()
+    close_clicked = pyqtSignal()
+    rename_requested = pyqtSignal()
+
+    def __init__(
+        self,
+        display_name: str,
+        chat_count: int,
+        selected: bool = False,
+        online: bool = True,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("session_card")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        border = f"2px solid {COLORS['accent']}" if selected else f"1px solid {COLORS['border']}"
+        self.setStyleSheet(
+            f"QFrame#session_card {{ background: {COLORS['card']}; border: {border}; "
+            f"border-radius: 8px; }}"
+            f"QFrame#session_card:hover {{ background: {COLORS['hover']}; }}"
+        )
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 8, 8, 8)
+        layout.setSpacing(8)
+
+        dot_color = COLORS["online"] if online else COLORS["muted"]
+        dot = QLabel("●")
+        dot.setStyleSheet(f"color: {dot_color}; font-size: 14px; font-weight: 900;")
+        dot.setFixedWidth(16)
+        layout.addWidget(dot)
+
+        text_col = QVBoxLayout()
+        text_col.setSpacing(2)
+        name_label = QLabel(display_name)
+        name_label.setStyleSheet("font-size: 13px; font-weight: 800;")
+        text_col.addWidget(name_label)
+        sub = QLabel(f"열린 톡방 {chat_count}개")
+        sub.setStyleSheet(f"color: {COLORS['muted']}; font-size: 11px;")
+        text_col.addWidget(sub)
+        layout.addLayout(text_col, stretch=1)
+
+        close_btn = CloseXButton()
+        close_btn.clicked.connect(self.close_clicked.emit)
+        layout.addWidget(close_btn)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        self.clicked.emit()
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
+        self.rename_requested.emit()
+        super().mouseDoubleClickEvent(event)
+
+
+# ---------------------------------------------------------------------------
 # Left panel compact room row (for quick switching)
 # ---------------------------------------------------------------------------
 
@@ -630,6 +694,14 @@ class WorkspaceWindow(QMainWindow):
         self.kakao_any_hwnd: int | None = None
         self.kakao_instances: dict[int, dict] = {}
         self.active_instance_pid: int | None = None
+        self.instance_names: dict[str, str] = dict(
+            self._loaded_settings.get("instance_names") or {}
+        )
+        self.kakao_exe_path: str = str(
+            self._loaded_settings.get("kakao_exe_path") or ""
+        )
+        self._session_card_widgets: dict[int, SessionCardWidget] = {}
+        self._pending_launch_pid: int | None = None
         self.last_image = None
         self.last_main_image = None
         self.reservations: list[dict] = list(
@@ -772,6 +844,17 @@ class WorkspaceWindow(QMainWindow):
         sep1.setStyleSheet(f"color: {COLORS['border']};")
         layout.addWidget(sep1)
 
+        self.status_session_label = QLabel("세션: —")
+        self.status_session_label.setStyleSheet(
+            f"color: {COLORS['muted']}; font-size: 13px; font-weight: 600;"
+        )
+        self.status_session_label.setMinimumWidth(100)
+        layout.addWidget(self.status_session_label)
+
+        sep_sess = QLabel("|")
+        sep_sess.setStyleSheet(f"color: {COLORS['border']};")
+        layout.addWidget(sep_sess)
+
         self.status_room_label = QLabel("방: (없음)")
         self.status_room_label.setStyleSheet(
             f"color: {COLORS['muted']}; font-size: 13px; font-weight: 600;"
@@ -803,6 +886,7 @@ class WorkspaceWindow(QMainWindow):
         layout.addWidget(self.status_action_label, stretch=1)
 
         self._update_status_strip_pc()
+        self._update_status_strip_session()
         self._update_status_strip_room()
         return strip
 
@@ -891,6 +975,28 @@ class WorkspaceWindow(QMainWindow):
             pc_text = f"PC: {name} {dot}"
         self.status_pc_label.setText(pc_text)
 
+    def _update_status_strip_session(self) -> None:
+        pid = self.active_instance_pid
+        if pid and pid in self.kakao_instances:
+            name = self._instance_display_name(pid)
+            short = name if len(name) <= 20 else name[:18] + "…"
+            self.status_session_label.setText(f"세션: {short} ●")
+            self.status_session_label.setStyleSheet(
+                f"color: {COLORS['accent']}; font-size: 13px; font-weight: 700;"
+            )
+        elif self.kakao_instances:
+            first_pid = next(iter(self.kakao_instances))
+            name = self._instance_display_name(first_pid)
+            self.status_session_label.setText(f"세션: {name}")
+            self.status_session_label.setStyleSheet(
+                f"color: {COLORS['muted']}; font-size: 13px; font-weight: 600;"
+            )
+        else:
+            self.status_session_label.setText("세션: —")
+            self.status_session_label.setStyleSheet(
+                f"color: {COLORS['muted']}; font-size: 13px; font-weight: 600;"
+            )
+
     def _update_status_strip_room(self) -> None:
         if self.selected_title:
             short = (
@@ -955,21 +1061,29 @@ class WorkspaceWindow(QMainWindow):
         layout.addLayout(self.pc_list_container)
         self._rebuild_pc_list()
 
-        multi_row = QHBoxLayout()
-        multi_btn = GhostButton("+ 인스턴스")
-        multi_btn.setToolTip(
-            "카카오톡 중복 실행 잠금을 해제합니다.\n"
-            "해제 후 카카오톡을 새로 실행하면 다른 계정으로 로그인할 수 있습니다."
+        sess_title = QLabel("카카오톡 세션")
+        sess_title.setStyleSheet("font-weight: 900; font-size: 14px; margin-top: 4px;")
+        layout.addWidget(sess_title)
+
+        self.sessions_scroll = QScrollArea()
+        self.sessions_scroll.setWidgetResizable(True)
+        self.sessions_scroll.setMaximumHeight(150)
+        self.sessions_scroll.setStyleSheet("background: transparent; border: none;")
+        sessions_wrap = QWidget()
+        self.sessions_container = QVBoxLayout(sessions_wrap)
+        self.sessions_container.setContentsMargins(0, 0, 0, 0)
+        self.sessions_container.setSpacing(4)
+        self.sessions_container.addStretch()
+        self.sessions_scroll.setWidget(sessions_wrap)
+        layout.addWidget(self.sessions_scroll)
+
+        add_session_btn = PrimaryButton("+ 카카오톡 추가")
+        add_session_btn.setToolTip(
+            "세마포어 해제 후 카카오톡을 자동 실행합니다.\n"
+            "로그인만 하면 새 세션이 목록에 나타납니다."
         )
-        multi_btn.clicked.connect(self._unlock_multi_instance)
-        multi_row.addWidget(multi_btn)
-        self.instance_count_label = QLabel("")
-        self.instance_count_label.setStyleSheet(
-            f"color: {COLORS['muted']}; font-size: 12px;"
-        )
-        multi_row.addWidget(self.instance_count_label)
-        multi_row.addStretch()
-        layout.addLayout(multi_row)
+        add_session_btn.clicked.connect(self._add_kakao_instance_one_click)
+        layout.addWidget(add_session_btn)
 
         rooms_header = QHBoxLayout()
         rooms_label = QLabel("열린 톡방")
@@ -1661,23 +1775,135 @@ class WorkspaceWindow(QMainWindow):
             "· exe를 --allow-send 로 실행하면 시작 시 실제 보내기 ON.",
         )
 
-    def _unlock_multi_instance(self) -> None:
-        ok, msg = unlock_multi_instance()
-        if ok:
-            self.set_status(msg)
-            QMessageBox.information(
-                self,
-                "멀티 인스턴스",
-                f"{msg}\n\n카카오톡을 새로 실행하면 다른 계정으로 로그인할 수 있습니다.\n"
-                "새 인스턴스 실행 후 '새로고침'을 눌러 주세요.",
+    def _instance_display_name(self, pid: int, inst: dict | None = None) -> str:
+        key = str(pid)
+        if key in self.instance_names:
+            return self.instance_names[key]
+        if inst is None:
+            inst = self.kakao_instances.get(pid) or {}
+        title = str(inst.get("main_title") or "")
+        if title and title.lower() not in ("카카오톡", "kakaotalk", ""):
+            return title
+        return f"세션 {pid}"
+
+    def _rebuild_session_cards(self) -> None:
+        self._clear_layout(self.sessions_container)
+        if not self.kakao_instances:
+            empty = QLabel("실행 중인 세션 없음")
+            empty.setStyleSheet(
+                f"color: {COLORS['muted']}; font-size: 12px; padding: 6px 4px;"
             )
+            self.sessions_container.addWidget(empty)
+        else:
+            for pid in sorted(self.kakao_instances.keys()):
+                inst = self.kakao_instances[pid]
+                name = self._instance_display_name(pid, inst)
+                chat_count = len(inst.get("chats") or [])
+                selected = pid == self.active_instance_pid
+                card = SessionCardWidget(
+                    name, chat_count, selected=selected, online=True
+                )
+                card.clicked.connect(lambda p=pid: self._select_instance(p))
+                card.close_clicked.connect(lambda p=pid: self._close_kakao_instance(p))
+                card.rename_requested.connect(lambda p=pid: self._rename_instance(p))
+                self.sessions_container.addWidget(card)
+                self._session_card_widgets[pid] = card
+        self.sessions_container.addStretch()
+
+    def _select_instance(self, pid: int) -> None:
+        self.active_instance_pid = pid
+        inst = self.kakao_instances.get(pid)
+        if not inst:
+            self._rebuild_session_cards()
+            self._update_status_strip_session()
+            return
+        hwnd = inst.get("main_hwnd") or inst.get("any_hwnd")
+        if hwnd:
+            self._select_kakao_window(hwnd)
+        elif inst.get("chats"):
+            h, t = inst["chats"][0]
+            self.set_selected_room(h, t, focus_work_tab=True)
+        else:
+            self._rebuild_session_cards()
+            self._update_status_strip_session()
+
+    def _rename_instance(self, pid: int) -> None:
+        current = self._instance_display_name(pid)
+        name, ok = QInputDialog.getText(
+            self, "세션 이름", "별명을 입력하세요:", text=current
+        )
+        if ok and name.strip():
+            self.instance_names[str(pid)] = name.strip()
+            self._queue_save_workspace_settings()
+            self._rebuild_session_cards()
+            self._rebuild_left_rooms()
+            self._update_status_strip_session()
+
+    def _close_kakao_instance(self, pid: int) -> None:
+        display = self._instance_display_name(pid)
+        reply = QMessageBox.question(
+            self,
+            "세션 종료",
+            f"「{display}」 카카오톡을 종료할까요?\n(PID {pid})",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        ok, msg = terminate_kakao_instance(pid)
+        if ok:
+            self.instance_names.pop(str(pid), None)
+            if self.active_instance_pid == pid:
+                self.active_instance_pid = None
+            self.set_status(msg)
+            self.refresh_candidates()
         else:
             self.set_status(msg, is_error=True)
-            QMessageBox.warning(
-                self,
-                "멀티 인스턴스",
-                f"{msg}\n\n관리자 권한으로 프로그램을 실행해 보세요.",
-            )
+            QMessageBox.warning(self, "세션 종료", msg)
+
+    def _pick_kakao_exe_path(self) -> bool:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "KakaoTalk.exe 선택",
+            str(find_kakao_exe(self.kakao_exe_path or None) or ""),
+            "Executable (*.exe)",
+        )
+        if not path:
+            return False
+        self.kakao_exe_path = path
+        self._queue_save_workspace_settings()
+        return True
+
+    def _add_kakao_instance_one_click(self) -> None:
+        self.set_status("카카오톡 추가 중… (세마포어 해제 → 실행)")
+        QApplication.processEvents()
+        ok, msg, new_pid = launch_new_instance(self.kakao_exe_path or None)
+        if ok and not self.kakao_exe_path:
+            found = find_kakao_exe(None)
+            if found:
+                self.kakao_exe_path = str(found)
+                self._queue_save_workspace_settings()
+        if not ok:
+            self.set_status(msg, is_error=True)
+            if "찾을 수 없습니다" in msg:
+                if self._pick_kakao_exe_path():
+                    self._add_kakao_instance_one_click()
+            else:
+                QMessageBox.warning(self, "카카오톡 추가", msg)
+            return
+        self._pending_launch_pid = new_pid
+        self.set_status(msg)
+        QTimer.singleShot(2000, self._after_kakao_launch)
+
+    def _after_kakao_launch(self) -> None:
+        self.refresh_candidates()
+        pid = self._pending_launch_pid
+        if pid and pid in self.kakao_instances:
+            self._select_instance(pid)
+        elif self.kakao_instances:
+            newest = max(self.kakao_instances.keys())
+            self._select_instance(newest)
+        self._pending_launch_pid = None
 
     def _get_local_ip(self) -> str:
         try:
@@ -1824,9 +2050,13 @@ class WorkspaceWindow(QMainWindow):
             }
 
         num_instances = len(self.kakao_instances)
-        self.instance_count_label.setText(
-            f"세션 {num_instances}개" if num_instances > 0 else ""
-        )
+        if self.active_instance_pid not in self.kakao_instances:
+            if self._pending_launch_pid and self._pending_launch_pid in self.kakao_instances:
+                self.active_instance_pid = self._pending_launch_pid
+            elif self.kakao_instances:
+                self.active_instance_pid = next(iter(self.kakao_instances))
+            else:
+                self.active_instance_pid = None
 
         chats = [(hwnd, title) for hwnd, kind, title, _rect, _cls in candidates if kind == "chat"]
         mains = [item for item in candidates if item[1] == "main"]
@@ -1883,6 +2113,8 @@ class WorkspaceWindow(QMainWindow):
                 self._viewing_dialog = False
                 self._update_input_target_labels()
 
+        self._rebuild_session_cards()
+        self._update_status_strip_session()
         self._rebuild_room_lists()
         self._rebuild_left_rooms()
         self._apply_dialog_priority(dialogs)
@@ -1946,7 +2178,7 @@ class WorkspaceWindow(QMainWindow):
                 self.left_rooms_container.addWidget(row)
         else:
             for pid, inst in self.kakao_instances.items():
-                session_name = inst.get("main_title", f"세션 {pid}")
+                session_name = self._instance_display_name(pid, inst)
                 session_chats = inst.get("chats", [])
                 header = QLabel(f"▸ {session_name} ({len(session_chats)})")
                 header.setStyleSheet(
@@ -2051,10 +2283,15 @@ class WorkspaceWindow(QMainWindow):
         log.info("Selecting kakao window (non-chat): hwnd=%d title=%r", hwnd, title)
         self.selected_hwnd = hwnd
         self.selected_title = title
+        pid = get_pid_for_hwnd(hwnd)
+        if pid:
+            self.active_instance_pid = pid
         self.header_label.setText(title)
         self._refresh_error_count = 0
         self.set_status(f"카카오톡 화면 표시 중 · {title}")
         self._update_input_target_labels()
+        self._rebuild_session_cards()
+        self._update_status_strip_session()
         self._rebuild_room_lists()
         self._rebuild_left_rooms()
         self.refresh_preview()
@@ -2088,11 +2325,16 @@ class WorkspaceWindow(QMainWindow):
         self._viewing_dialog = False
         self.selected_hwnd = hwnd
         self.selected_title = title
+        pid = get_pid_for_hwnd(hwnd)
+        if pid:
+            self.active_instance_pid = pid
         self.header_label.setText(title)
         self._refresh_error_count = 0
         self.set_status(f"온라인 · 선택: {title}")
         self._update_input_target_labels()
         self._update_status_strip_room()
+        self._rebuild_session_cards()
+        self._update_status_strip_session()
         if focus_work_tab:
             self.tabs.setCurrentIndex(0)
         if any(h == hwnd for h, _ in self.chat_rooms):
@@ -2157,6 +2399,8 @@ class WorkspaceWindow(QMainWindow):
             ai=ai,
             known_room_titles=sorted(self.known_rooms.keys()),
             reservations=self.reservations,
+            instance_names=self.instance_names,
+            kakao_exe_path=self.kakao_exe_path,
         )
 
     def _verify_main_list_click(self, rooms_before: int) -> None:
