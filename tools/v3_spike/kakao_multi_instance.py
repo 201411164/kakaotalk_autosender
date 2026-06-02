@@ -38,7 +38,7 @@ KAKAO_DEFAULT_PATHS = [
 
 NTSTATUS = ctypes.c_long
 STATUS_INFO_LENGTH_MISMATCH = 0xC0000004
-SystemHandleInformation = 16
+SystemExtendedHandleInformation = 64
 PROCESS_DUP_HANDLE = 0x0040
 PROCESS_QUERY_INFORMATION = 0x0400
 DUPLICATE_CLOSE_SOURCE = 0x0001
@@ -47,24 +47,45 @@ OBJ_SEMAPHORE = 5  # ObjectTypeIndex varies; we match by name instead
 ntdll = ctypes.windll.ntdll
 kernel32 = ctypes.windll.kernel32
 
+ntdll.NtQuerySystemInformation.restype = NTSTATUS
+ntdll.NtQuerySystemInformation.argtypes = [
+    wt.ULONG, ctypes.c_void_p, wt.ULONG, ctypes.POINTER(wt.ULONG)
+]
+ntdll.NtDuplicateObject.restype = NTSTATUS
+ntdll.NtDuplicateObject.argtypes = [
+    wt.HANDLE, wt.HANDLE, wt.HANDLE, ctypes.POINTER(wt.HANDLE),
+    wt.ULONG, wt.ULONG, wt.ULONG,
+]
+ntdll.NtQueryObject.restype = NTSTATUS
+ntdll.NtQueryObject.argtypes = [
+    wt.HANDLE, wt.ULONG, ctypes.c_void_p, wt.ULONG, ctypes.POINTER(wt.ULONG)
+]
 
-class SYSTEM_HANDLE_TABLE_ENTRY(ctypes.Structure):
+
+class SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX(ctypes.Structure):
     _fields_ = [
-        ("OwnerPid", wt.USHORT),
-        ("CreatorBackTraceIndex", wt.USHORT),
-        ("ObjectTypeIndex", ctypes.c_ubyte),
-        ("HandleAttributes", ctypes.c_ubyte),
-        ("HandleValue", wt.USHORT),
         ("Object", ctypes.c_void_p),
+        ("UniqueProcessId", ctypes.c_size_t),
+        ("HandleValue", ctypes.c_size_t),
         ("GrantedAccess", wt.DWORD),
+        ("CreatorBackTraceIndex", wt.USHORT),
+        ("ObjectTypeIndex", wt.USHORT),
+        ("HandleAttributes", wt.DWORD),
+        ("Reserved", wt.DWORD),
+    ]
+
+
+class UNICODE_STRING(ctypes.Structure):
+    _fields_ = [
+        ("Length", wt.USHORT),
+        ("MaximumLength", wt.USHORT),
+        ("Buffer", wt.LPWSTR),
     ]
 
 
 class OBJECT_NAME_INFORMATION(ctypes.Structure):
     _fields_ = [
-        ("Length", wt.USHORT),
-        ("MaximumLength", wt.USHORT),
-        ("Buffer", ctypes.c_wchar_p),
+        ("Name", UNICODE_STRING),
     ]
 
 
@@ -106,20 +127,21 @@ def _close_semaphore_for_pid(pid: int) -> bool:
 
     while True:
         status = ntdll.NtQuerySystemInformation(
-            SystemHandleInformation, buf, buf_size, ctypes.byref(ret_len)
+            SystemExtendedHandleInformation, buf, buf_size, ctypes.byref(ret_len)
         )
-        if status == STATUS_INFO_LENGTH_MISMATCH:
+        status_u32 = ctypes.c_ulong(status).value
+        if status_u32 == STATUS_INFO_LENGTH_MISMATCH:
             buf_size *= 2
             buf = ctypes.create_string_buffer(buf_size)
             continue
         if status < 0:
-            log.error("NtQuerySystemInformation failed: 0x%08X", status & 0xFFFFFFFF)
+            log.error("NtQuerySystemInformation failed: 0x%08X", status_u32)
             return False
         break
 
-    count = ctypes.c_ulong.from_buffer_copy(buf, 0).value
-    entry_offset = ctypes.sizeof(ctypes.c_ulong)
-    entry_size = ctypes.sizeof(SYSTEM_HANDLE_TABLE_ENTRY)
+    count = ctypes.c_size_t.from_buffer_copy(buf, 0).value
+    entry_offset = ctypes.sizeof(ctypes.c_size_t) * 2
+    entry_size = ctypes.sizeof(SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX)
 
     proc_handle = kernel32.OpenProcess(
         PROCESS_DUP_HANDLE | PROCESS_QUERY_INFORMATION, False, pid
@@ -134,14 +156,14 @@ def _close_semaphore_for_pid(pid: int) -> bool:
             offset = entry_offset + i * entry_size
             if offset + entry_size > len(buf):
                 break
-            entry = SYSTEM_HANDLE_TABLE_ENTRY.from_buffer_copy(buf, offset)
-            if entry.OwnerPid != pid:
+            entry = SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX.from_buffer_copy(buf, offset)
+            if int(entry.UniqueProcessId) != pid:
                 continue
 
             dup = wt.HANDLE()
             status = ntdll.NtDuplicateObject(
                 proc_handle,
-                entry.HandleValue,
+                wt.HANDLE(int(entry.HandleValue)),
                 kernel32.GetCurrentProcess(),
                 ctypes.byref(dup),
                 0, 0, 0,
@@ -161,19 +183,21 @@ def _close_semaphore_for_pid(pid: int) -> bool:
                 continue
 
             info = OBJECT_NAME_INFORMATION.from_buffer_copy(name_buf)
-            name = info.Buffer or ""
+            if not info.Name.Buffer or info.Name.Length <= 0:
+                continue
+            name = ctypes.wstring_at(info.Name.Buffer, info.Name.Length // 2)
             if SEMAPHORE_GUID not in name:
                 continue
 
             log.info(
                 "Found semaphore handle %d in PID %d: %s",
-                entry.HandleValue, pid, name,
+                int(entry.HandleValue), pid, name,
             )
             # Close the handle in the target process
             dup2 = wt.HANDLE()
             ntdll.NtDuplicateObject(
                 proc_handle,
-                entry.HandleValue,
+                wt.HANDLE(int(entry.HandleValue)),
                 kernel32.GetCurrentProcess(),
                 ctypes.byref(dup2),
                 0, 0, DUPLICATE_CLOSE_SOURCE,

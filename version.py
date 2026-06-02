@@ -1,6 +1,6 @@
 """Kakao Manager V3 버전 및 자동 업데이트 메타."""
 
-__version__ = "1.4.7"
+__version__ = "1.5.2"
 __app_name__ = "KakaoManager"
 __author__ = "kakaotalk_autosender"
 

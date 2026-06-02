@@ -41,6 +41,8 @@ def default_settings() -> dict[str, Any]:
             "chat_context": "",
             "guardrails": "",
         },
+        "ai_presets": {},
+        "monitor_rooms": [],
         "known_room_titles": [],
         "reservations": [],
         "instance_names": {},
@@ -62,6 +64,8 @@ def _serialize_reservation(item: dict) -> dict:
     }
     if item.get("hwnd"):
         out["hwnd"] = int(item["hwnd"])
+    if item.get("instance_pid") is not None:
+        out["instance_pid"] = int(item["instance_pid"])
     return out
 
 
@@ -75,6 +79,23 @@ def load_workspace_settings() -> dict[str, Any]:
         base = default_settings()
         base["ui"].update(raw.get("ui") or {})
         base["ai"].update(raw.get("ai") or {})
+        raw_presets = raw.get("ai_presets")
+        if isinstance(raw_presets, dict):
+            base["ai_presets"] = {
+                str(name): dict(cfg)
+                for name, cfg in raw_presets.items()
+                if isinstance(cfg, dict)
+            }
+        raw_monitor = raw.get("monitor_rooms")
+        if isinstance(raw_monitor, list):
+            base["monitor_rooms"] = [
+                {
+                    "title": str(m.get("title", "")),
+                    "keywords": [str(k) for k in (m.get("keywords") or [])],
+                }
+                for m in raw_monitor
+                if isinstance(m, dict) and m.get("title")
+            ]
         base["known_room_titles"] = list(raw.get("known_room_titles") or [])
         reservations = []
         for row in raw.get("reservations") or []:
@@ -86,12 +107,14 @@ def load_workspace_settings() -> dict[str, Any]:
                 continue
             if send_at <= datetime.now():
                 continue
+            inst_pid = row.get("instance_pid")
             reservations.append(
                 {
                     "room": row.get("room", ""),
                     "message": row.get("message", ""),
                     "send_at": send_at,
                     "hwnd": row.get("hwnd"),
+                    "instance_pid": int(inst_pid) if inst_pid is not None else None,
                     "created_at": datetime.now(),
                 }
             )
@@ -114,12 +137,16 @@ def save_workspace_settings(
     reservations: list[dict],
     instance_names: dict[str, str] | None = None,
     kakao_exe_path: str = "",
+    ai_presets: dict[str, Any] | None = None,
+    monitor_rooms: list[dict] | None = None,
 ) -> None:
     payload = {
         "version": 1,
         "last_updated": datetime.now().isoformat(timespec="seconds"),
         "ui": ui,
         "ai": ai,
+        "ai_presets": ai_presets or {},
+        "monitor_rooms": monitor_rooms or [],
         "known_room_titles": known_room_titles,
         "reservations": [_serialize_reservation(r) for r in reservations],
         "instance_names": instance_names or {},

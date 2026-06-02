@@ -247,6 +247,14 @@ def is_window_valid(hwnd: int) -> bool:
         return False
 
 
+def is_window_alive(hwnd: int) -> bool:
+    """Window exists (may be minimized). Use for ownership checks, not capture."""
+    try:
+        return bool(win32gui.IsWindow(hwnd)) and bool(win32gui.IsWindowVisible(hwnd))
+    except Exception:
+        return False
+
+
 def close_window(hwnd: int) -> None:
     try:
         win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)

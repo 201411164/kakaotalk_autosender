@@ -1,0 +1,14 @@
+PyQt6>=6.4.0
+pandas>=1.5.0
+pillow>=9.0.0
+pyperclip>=1.8.0
+pywin32>=305
+pymysql>=1.0.0
+python-dotenv>=1.0.0
+openpyxl>=3.0.0
+pyinstaller>=5.0
+openai>=1.0.0
+requests>=2.31.0
+packaging>=23.0
+fastapi>=0.100.0
+uvicorn>=0.23.0
