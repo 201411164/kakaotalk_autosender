@@ -32,8 +32,17 @@ jobs:
           echo "TAG_NAME=$tag" >> $env:GITHUB_OUTPUT
 
       - name: Sync version.py
+        shell: bash
         run: |
-          python -c "p='version.py'; t=open(p,encoding='utf-8').read(); import re; t=re.sub(r'__version__\s*=\s*\"[^\"]+\"', '__version__ = \"${{ steps.version.outputs.VERSION }}\"', t); open(p,'w',encoding='utf-8').write(t)"
+          python - "${{ steps.version.outputs.VERSION }}" <<'PY'
+          import re, sys
+          ver = sys.argv[1]
+          p = "version.py"
+          t = open(p, encoding="utf-8").read()
+          t = re.sub(r'__version__\s*=\s*"[^"]+"', f'__version__ = "{ver}"', t)
+          open(p, "w", encoding="utf-8").write(t)
+          print("version.py synced to", ver)
+          PY
 
       - name: Build onedir
         run: pyinstaller --noconfirm KakaoManager-V3.spec
