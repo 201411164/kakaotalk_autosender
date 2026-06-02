@@ -1,0 +1,59 @@
+name: Build KakaoManager-V3 Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Get version from tag
+        id: version
+        run: |
+          $tag = "$env:GITHUB_REF_NAME"
+          $ver = $tag.TrimStart('v')
+          echo "VERSION=$ver" >> $env:GITHUB_OUTPUT
+          echo "TAG_NAME=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Sync version.py
+        run: |
+          python -c "p='version.py'; t=open(p,encoding='utf-8').read(); import re; t=re.sub(r'__version__\s*=\s*\"[^\"]+\"', '__version__ = \"${{ steps.version.outputs.VERSION }}\"', t); open(p,'w',encoding='utf-8').write(t)"
+
+      - name: Build onedir
+        run: pyinstaller --noconfirm KakaoManager-V3.spec
+
+      - name: Create zip
+        run: |
+          Compress-Archive -Path dist\KakaoManager-V3 -DestinationPath KakaoManager-V3_v${{ steps.version.outputs.VERSION }}.zip -Force
+          Get-ChildItem *.zip | ForEach-Object { Write-Host $_.Name, $_.Length }
+
+      - name: Upload release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.TAG_NAME }}
+          name: KakaoManager-V3 ${{ steps.version.outputs.TAG_NAME }}
+          files: KakaoManager-V3_v${{ steps.version.outputs.VERSION }}.zip
+          body: |
+            ## KakaoManager-V3 ${{ steps.version.outputs.TAG_NAME }}
+
+            - 압축 해제 후 `KakaoManager-V3/KakaoManager-V3.exe` 실행
+            - 자동 업데이트: 실행 중 주기적으로 GitHub Release zip 적용
+            - Private repo: exe 옆 `.km_github_token` 또는 `GITHUB_TOKEN` env
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
