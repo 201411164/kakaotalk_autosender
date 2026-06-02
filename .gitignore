@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Secrets
+.env
+.live.env
+.local.env
+
+# 로컬 런타임 데이터 (사용자별)
+kakao_sender_settings_*.json
+templates_*.json
+logs_*.json
+
+# V3 spike local captures (may contain chat contents)
+tools/v3_spike/output/
+tools/v3_spike/logs/
+v3_registered_pcs.json
+v3_workspace_settings.json
+v3_monitor_events.jsonl
+v3_guard_blocks.jsonl
+
+# Build/release artifacts (zips are uploaded to GitHub Releases, not committed)
+KakaoManager-V3_v*.zip
+*.zip
+
+# PyInstaller
+build/
+dist/
+
+# IDE
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini

@@ -1,0 +1,4 @@
+# V3 원격 Hub 서버 전용 (선택)
+fastapi>=0.100.0
+uvicorn>=0.23.0
+requests>=2.31.0
