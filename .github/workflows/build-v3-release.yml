@@ -49,7 +49,10 @@ jobs:
 
       - name: Create zip
         run: |
-          Compress-Archive -Path dist\KakaoManager-V3 -DestinationPath KakaoManager-V3_v${{ steps.version.outputs.VERSION }}.zip -Force
+          $dir = "dist\KakaoManager-V3_v${{ steps.version.outputs.VERSION }}"
+          if (-not (Test-Path $dir)) { Write-Error "Build output not found: $dir"; exit 1 }
+          # Archive the folder CONTENTS at the zip root (matches local build-v3.bat layout).
+          Compress-Archive -Path "$dir\*" -DestinationPath "KakaoManager-V3_v${{ steps.version.outputs.VERSION }}.zip" -Force
           Get-ChildItem *.zip | ForEach-Object { Write-Host $_.Name, $_.Length }
 
       - name: Upload release
